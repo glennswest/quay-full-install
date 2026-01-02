@@ -145,6 +145,13 @@ mkdir -p $QUAY_ROOT/storage
 # Quay loads config from conf/stack/ directory
 mkdir -p $QUAY_INSTALL/conf/stack
 
+echo "=== Generating instance keys for JWT authentication ==="
+cd $QUAY_INSTALL/conf
+openssl genrsa -out quay.pem 2048
+openssl rsa -in quay.pem -pubout -out quay.pub
+echo "quay-$(date +%s)" > quay.kid
+chmod 600 quay.pem
+
 cat > $QUAY_INSTALL/conf/stack/config.yaml << EOF
 TESTING: false
 AUTHENTICATION_TYPE: Database
@@ -184,6 +191,8 @@ TAG_EXPIRATION_OPTIONS:
 USER_EVENTS_REDIS:
     host: localhost
     port: 6379
+INSTANCE_SERVICE_KEY_KID_LOCATION: /opt/quay/conf/quay.kid
+INSTANCE_SERVICE_KEY_LOCATION: /opt/quay/conf/quay.pem
 EOF
 
 # Keep a copy in QUAY_ROOT for reference

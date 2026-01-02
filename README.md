@@ -435,6 +435,29 @@ application.register_blueprint(v1_bp, url_prefix="/v1")
 
 ---
 
+### Issue 16: Missing Instance Service Keys for JWT Authentication
+
+**Problem:** When pushing or pulling images, the registry fails with authentication errors. Quay logs show `FileNotFoundError: No such file or directory: '/opt/quay/conf/quay.kid'`.
+
+**Root cause:** The v2 registry API uses JWT tokens for authentication. Quay needs RSA keys to sign these tokens, but they are not generated during installation.
+
+**Solution:** Generate the instance service keys and configure their locations:
+```bash
+cd /opt/quay/conf
+openssl genrsa -out quay.pem 2048
+openssl rsa -in quay.pem -pubout -out quay.pub
+echo "quay-$(date +%s)" > quay.kid
+chmod 600 quay.pem
+```
+
+Add to config.yaml:
+```yaml
+INSTANCE_SERVICE_KEY_KID_LOCATION: /opt/quay/conf/quay.kid
+INSTANCE_SERVICE_KEY_LOCATION: /opt/quay/conf/quay.pem
+```
+
+---
+
 ## Configuration
 
 ### Quay Configuration (`/opt/quay/conf/stack/config.yaml`)
