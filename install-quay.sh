@@ -18,7 +18,7 @@ QUAY_PORT="80"
 echo "=== Installing system dependencies ==="
 dnf install -y \
     git curl gcc gcc-c++ make \
-    postgresql-server postgresql-contrib nginx \
+    postgresql-server postgresql-contrib nginx openssl \
     openssl-devel libffi-devel zlib-devel bzip2-devel \
     readline-devel sqlite-devel xz-devel \
     libxml2-devel libxslt-devel openldap-devel \
@@ -149,7 +149,8 @@ echo "=== Generating instance keys for JWT authentication ==="
 cd $QUAY_INSTALL/conf
 openssl genrsa -out quay.pem 2048
 openssl rsa -in quay.pem -pubout -out quay.pub
-echo "quay-$(date +%s)" > quay.kid
+# Key ID must not have trailing newline for proper JWT token matching
+echo -n "quay-$(date +%s)" > quay.kid
 chmod 600 quay.pem
 
 cat > $QUAY_INSTALL/conf/stack/config.yaml << EOF
@@ -191,6 +192,8 @@ TAG_EXPIRATION_OPTIONS:
 USER_EVENTS_REDIS:
     host: localhost
     port: 6379
+FEATURE_LOG_EXPORTS: true
+FEATURE_ACTION_LOG_ROTATION: true
 INSTANCE_SERVICE_KEY_KID_LOCATION: /opt/quay/conf/quay.kid
 INSTANCE_SERVICE_KEY_LOCATION: /opt/quay/conf/quay.pem
 EOF
@@ -270,6 +273,90 @@ with app.app_context():
 "
 # Ensure admin user is verified (in case user already existed)
 sudo -u postgres psql -d quay -c "UPDATE \"user\" SET verified = true WHERE username = 'admin';" 2>/dev/null || true
+
+echo "=== Creating storage location and registering service key ==="
+PYTHONPATH=$QUAY_INSTALL python -c "
+import json
+import datetime
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from jwkest.jwk import RSAKey
+from app import app
+from data import model
+from data.database import configure, ImageStorageLocation
+
+with app.app_context():
+    configure(app.config)
+
+    # Create 'default' storage location if it doesn't exist
+    try:
+        loc = ImageStorageLocation.get(ImageStorageLocation.name == 'default')
+        print('Storage location default already exists')
+    except ImageStorageLocation.DoesNotExist:
+        ImageStorageLocation.create(name='default')
+        print('Created storage location: default')
+
+    # Read the service key files
+    with open('/opt/quay/conf/quay.pem', 'rb') as f:
+        private_key_pem = f.read()
+    with open('/opt/quay/conf/quay.kid', 'r') as f:
+        kid = f.read().strip()
+
+    # Check if service key already exists
+    existing = model.service_keys.get_service_key(kid, approved_only=False)
+    if existing:
+        print(f'Service key {kid} already exists')
+    else:
+        # Convert PEM to JWK
+        private_key = serialization.load_pem_private_key(
+            private_key_pem, password=None, backend=default_backend()
+        )
+        public_key = private_key.public_key()
+        public_pem = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        rsa_key = RSAKey(use='sig')
+        rsa_key.load_key(public_key)
+        jwk = rsa_key.serialize(private=False)
+
+        # Create and approve the service key
+        expiration = datetime.datetime.utcnow() + datetime.timedelta(days=3650)
+        key = model.service_keys.create_service_key(
+            name='Quay Instance Key',
+            kid=kid,
+            service='quay',
+            jwk=jwk,
+            metadata={},
+            expiration_date=expiration
+        )
+        model.service_keys.approve_service_key(kid, 'automatic', notes='Auto-approved during install')
+        print(f'Created and approved service key: {kid}')
+"
+
+echo "=== Creating openshift organization ==="
+PYTHONPATH=$QUAY_INSTALL python -c "
+from app import app
+from data import model
+from data.database import configure
+
+with app.app_context():
+    configure(app.config)
+
+    # Get admin user
+    admin = model.user.get_user('admin')
+    if not admin:
+        print('Error: admin user not found')
+        exit(1)
+
+    # Check if openshift org already exists
+    existing = model.organization.get_organization('openshift')
+    if existing:
+        print('Organization openshift already exists')
+    else:
+        org = model.organization.create_organization('openshift', 'openshift@registry.gw.lo', admin)
+        print(f'Created organization: {org.username}')
+"
 
 echo "=== Starting services ==="
 systemctl start quay
