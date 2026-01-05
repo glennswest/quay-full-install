@@ -458,6 +458,100 @@ INSTANCE_SERVICE_KEY_LOCATION: /opt/quay/conf/quay.pem
 
 ---
 
+### Issue 17: Service Key ID Trailing Newline
+
+**Problem:** JWT token authentication fails with "Unknown service key" even though the service key files exist and the key is in the database.
+
+**Error in logs:**
+```
+Unknown service key: 'quay-1767316781\n'
+```
+
+**Root cause:** The key ID file was created with a trailing newline (`echo "quay-..." > quay.kid`), but the database stores the key without the newline. When Quay reads the file and looks up the key, the IDs don't match.
+
+**Solution:** Use `echo -n` to create the key ID file without a trailing newline:
+```bash
+echo -n "quay-$(date +%s)" > quay.kid
+```
+
+---
+
+### Issue 18: Service Key Not Registered in Database
+
+**Problem:** Even with correctly formatted key files, JWT authentication fails because Quay needs the service key to be registered and approved in the database.
+
+**Error:**
+```
+Unknown service key: 'quay-1767316781'
+```
+
+**Root cause:** Quay's JWT verification looks up the public key from the database `servicekeyapproval` table, not from the filesystem. The private key signs tokens, but the database must have the corresponding public key for verification.
+
+**Solution:** Register and approve the service key in the database after migrations:
+```python
+from jwkest.jwk import RSAKey
+from data import model
+import datetime
+
+# Load and convert the public key to JWK format
+rsa_key = RSAKey(use='sig')
+rsa_key.load_key(public_key)
+jwk = rsa_key.serialize(private=False)
+
+# Create and approve the key
+expiration = datetime.datetime.utcnow() + datetime.timedelta(days=3650)
+model.service_keys.create_service_key(
+    name='Quay Instance Key',
+    kid=kid,
+    service='quay',
+    jwk=jwk,
+    metadata={},
+    expiration_date=expiration
+)
+model.service_keys.approve_service_key(kid, 'automatic', notes='Auto-approved during install')
+```
+
+---
+
+### Issue 19: Storage Location "default" Not in Database
+
+**Problem:** Blob uploads fail with HTTP 500 errors and KeyError in logs.
+
+**Error:**
+```
+KeyError: 'default'
+```
+
+**Root cause:** Quay's database migrations create storage locations like "s3_us_east_1" and "local", but not "default". When config.yaml uses `DISTRIBUTED_STORAGE_PREFERENCE: [default]`, the lookup fails because there's no matching `ImageStorageLocation` record.
+
+**Solution:** Create the storage location in the database:
+```python
+from data.database import ImageStorageLocation
+
+try:
+    ImageStorageLocation.get(ImageStorageLocation.name == 'default')
+except ImageStorageLocation.DoesNotExist:
+    ImageStorageLocation.create(name='default')
+```
+
+---
+
+### Issue 20: Organization Must Exist for Image Push
+
+**Problem:** Pushing images to a namespace (e.g., `openshift/release`) fails with 401 Unauthorized.
+
+**Root cause:** Quay requires the organization (namespace) to exist before images can be pushed. When using `oc adm release mirror`, the "openshift" organization must already be created.
+
+**Solution:** Create the organization in the database after creating the admin user:
+```python
+from data import model
+
+admin = model.user.get_user('admin')
+org = model.organization.create_organization('openshift', 'openshift@registry.gw.lo', admin)
+```
+
+---
+
 ## Configuration
 
 ### Quay Configuration (`/opt/quay/conf/stack/config.yaml`)
@@ -583,12 +677,73 @@ cd /opt/quay
 source venv/bin/activate
 ```
 
+## Mirroring OpenShift Releases
+
+Mirror OpenShift releases to the local registry for disconnected/air-gapped installations.
+
+### Usage
+
+```bash
+# From your workstation (not the registry server)
+./mirror.sh 4.20.8
+```
+
+This submits a background job to the registry server. The mirror runs directly on the registry to avoid double network hops.
+
+### Monitor Progress
+
+```bash
+# Follow the log
+ssh root@registry.gw.lo 'tail -f /root/mirror-4.20.8.log'
+
+# Check if complete
+ssh root@registry.gw.lo 'grep -E "(real|Success|error:)" /root/mirror-4.20.8.log'
+```
+
+### Timing
+
+Typical mirror time for a full OpenShift release (~20GB, 193 images): **5-6 minutes** when running on the registry server.
+
+### Output
+
+After mirroring, use these settings in `install-config.yaml`:
+
+```yaml
+imageContentSources:
+- mirrors:
+  - registry.gw.lo/openshift/release
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+- mirrors:
+  - registry.gw.lo/openshift/release
+  source: quay.io/openshift-release-dev/ocp-release
+```
+
+### Scripts
+
+| Script | Location | Purpose |
+|--------|----------|---------|
+| `mirror.sh` | Workstation | Submits mirror job to registry |
+| `mirror-local.sh` | Registry | Executes mirror with retry logic |
+| `setup-quay-servicekey.sh` | Registry | Configures Redis, storage, service key |
+
+### Prerequisites
+
+The registry needs:
+- `pullsecret-combined.json` at `/root/` with credentials for:
+  - `quay.io` (upstream OpenShift images)
+  - `registry.gw.lo` (local registry - admin:admin123)
+- `oc` CLI installed
+- Sufficient storage (~25GB per release)
+
 ## Files
 
 ```
-quay-native-install/
-├── README.md           # This documentation
-└── install-quay.sh     # Installation script
+quick-quay/
+├── README.md                  # This documentation
+├── install-quay.sh            # Installation script
+├── mirror.sh                  # Submit mirror job from workstation
+├── mirror-local.sh            # Mirror script (runs on registry)
+└── setup-quay-servicekey.sh   # Registry setup (Redis, storage, keys)
 ```
 
 ## Requirements
